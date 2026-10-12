@@ -1,3 +1,8 @@
+# Mosaic CI -- the shared Starworks CI standard (see docs/ci.md).
+# One matrix: OS x compiler x config. Every leg runs the SAME entry points:
+#   build:  scripts/build.{ps1,sh} <Config>
+#   test:   scripts/run-tests.{ps1,sh} <Config> --rng-seed <N>   (two seeds)
+# plus a standalone-header check on the gcc/clang legs, and sanitizer lanes.
 name: CI
 
 on:
@@ -6,36 +11,172 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  XCODE_VERSION: "16.4"   # macOS toolchain pin (xcode-select)
+
 jobs:
-  windows-msvc:
-    runs-on: windows-latest
+  build-test:
+    name: ${{ matrix.leg }}-${{ matrix.config }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+        leg: [windows-msvc, linux-gcc-14, linux-clang-19, macos-appleclang]
+        include:
+          - leg: windows-msvc
+            os: windows-2025
+            shell: pwsh
+            ext: ps1
+          - leg: linux-gcc-14
+            os: ubuntu-24.04
+            shell: bash
+            ext: sh
+            cc: gcc-14
+            cxx: g++-14
+          - leg: linux-clang-19
+            os: ubuntu-24.04
+            shell: bash
+            ext: sh
+            cc: clang-19
+            cxx: clang++-19
+          - leg: macos-appleclang
+            os: macos-15
+            shell: bash
+            ext: sh
+            cc: clang
+            cxx: clang++
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+      # One fixed seed (reproduces exactly run to run) and one that moves with
+      # the run number, so test-order coupling keeps being probed. Both are in
+      # the console banner and the JUnit file name.
+      - name: Seeds
+        shell: bash
+        run: |
+          echo "SEED_FIXED=1" >> "$GITHUB_ENV"
+          echo "SEED_RUN=$(( ${{ github.run_number }} % 98999 + 1000 ))" >> "$GITHUB_ENV"
 
-      # The repo vendors premake5.exe (vendor/premake5/), so generation needs no
-      # download and stays version-locked to what the library was authored against.
-      - name: Generate (VS2022 solution)
-        run: .\vendor\premake5\premake5.exe vs2022
+      - name: Install Clang 19
+        if: matrix.leg == 'linux-clang-19'
+        run: |
+          if ! command -v clang++-19 >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends clang-19
+          fi
 
-      - name: Build Release
-        run: msbuild Mosaic.sln /p:Configuration=Release /m /nologo
+      - name: Select Xcode ${{ env.XCODE_VERSION }}
+        if: runner.os == 'macOS'
+        run: |
+          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          xcodebuild -version
 
-      - name: Test Release
-        run: .\bin\Release-windows-x86_64\MosaicTests\MosaicTests.exe
+      - name: Build ${{ matrix.config }}
+        id: build
+        run: scripts/build.${{ matrix.ext }} ${{ matrix.config }}
 
-  # A Linux job (gcc + clang) is added once the cross-platform burn-down passes.
-  # Part A ships the windows-msvc job only -- no red CI.
+      - name: Headers compile standalone
+        if: runner.os != 'Windows'
+        run: ci/check-headers.sh "${CXX:-clang++}" ${{ matrix.config == 'Debug' && 'debug' || 'release' }}
+
+      - name: Test ${{ matrix.config }} (seed ${{ env.SEED_FIXED }})
+        run: scripts/run-tests.${{ matrix.ext }} ${{ matrix.config }} --rng-seed ${{ env.SEED_FIXED }}
+
+      - name: Test ${{ matrix.config }} (seed ${{ env.SEED_RUN }})
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: scripts/run-tests.${{ matrix.ext }} ${{ matrix.config }} --rng-seed ${{ env.SEED_RUN }}
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.leg }}-${{ matrix.config }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Sanitizer lanes, ubuntu-24.04 + the pinned Clang 19, through the same
+  # entry points (a premake option selects the lane). The work-scheduler tests
+  # run a real std::thread pool, which is what the TSan lane is for.
+  sanitize:
+    name: sanitize-${{ matrix.lane.name }}-Debug
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lane:
+          - name: asan-ubsan
+            premake: --sanitize=address
+          - name: tsan
+            premake: --sanitize=thread
+    env:
+      CC: clang-19
+      CXX: clang++-19
+      ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1:abort_on_error=1
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Seeds
+        run: |
+          echo "SEED_FIXED=1" >> "$GITHUB_ENV"
+          echo "SEED_RUN=$(( ${{ github.run_number }} % 98999 + 1000 ))" >> "$GITHUB_ENV"
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-19 libclang-rt-19-dev libstdc++-14-dev
+          clang++-19 --version
+
+      - name: Build
+        id: build
+        run: scripts/build.sh Debug ${{ matrix.lane.premake }}
+
+      - name: Test (seed ${{ env.SEED_FIXED }})
+        run: scripts/run-tests.sh Debug --rng-seed "$SEED_FIXED"
+
+      - name: Test (seed ${{ env.SEED_RUN }})
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: scripts/run-tests.sh Debug --rng-seed "$SEED_RUN"
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-sanitize-${{ matrix.lane.name }}-Debug
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
 
   # Discord: post this repo's CI result into its thread in the ⚙️・ci-builds forum (shared action:
   # StarworksDev/.github/actions/discord-ci-notify). Never for pull requests (fork PRs get no secrets).
   notify:
     name: Discord notify
-    needs: [windows-msvc]
+    needs: [build-test, sanitize]
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       actions: read
       contents: read
